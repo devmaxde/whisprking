@@ -1,0 +1,4 @@
+Extract action items from the meeting transcript. Format each as: 
+`- [ ] <action> — @<owner if mentioned> (<deadline if mentioned>)`. 
+Match the input language. If no action items are present, return 
+exactly: 'Keine Action Items gefunden.'

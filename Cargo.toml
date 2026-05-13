@@ -1,0 +1,74 @@
+[package]
+name = "whisprking"
+version = "0.1.0"
+edition = "2021"
+description = "Local speech-to-text for macOS — Rust port"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "whisprking"
+path = "src/lib.rs"
+
+[[bin]]
+name = "whisprking"
+path = "src/main.rs"
+
+[features]
+default = ["sherpa"]
+# Enable sherpa-onnx backend for NVIDIA NeMo Parakeet transducer models.
+# Adds a hefty C++ build (first compile takes ~10 minutes).
+sherpa = ["dep:sherpa-onnx", "dep:tar", "dep:bzip2"]
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+regex = "1"
+log = "0.4"
+env_logger = "0.11"
+reqwest = { version = "^0.13", default-features = false, features = [
+  "blocking",
+  "json",
+] }
+tempfile = "3"
+arboard = "3"
+rdev = "0.5"
+cpal = "0.17"
+hound = "3.5"
+# Local whisper.cpp bindings. Metal acceleration on macOS by default.
+whisper-rs = { version = "0.16", default-features = false, features = [
+  "metal",
+] }
+# Sherpa-onnx for NVIDIA NeMo Parakeet (opt-in via `sherpa` feature).
+sherpa-onnx = { version = "1.13", default-features = false, features = [
+  "static",
+], optional = true }
+tar = { version = "0.4", optional = true }
+bzip2 = { version = "0.6", optional = true }
+
+# GUI
+eframe = { version = "0.34", default-features = false, features = [
+  "default_fonts",
+  "glow",
+  "wayland",
+  "x11",
+] }
+egui = "0.34"
+tray-icon = "0.24"
+image = { version = "0.25", default-features = false, features = ["png"] }
+opener = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.25"
+core-foundation = "0.10"
+
+[profile.release]
+lto = "thin"
+opt-level = "z"
+codegen-units = 1
+strip = "symbols"
