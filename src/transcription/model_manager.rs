@@ -95,15 +95,50 @@ pub fn available_models() -> &'static HashMap<&'static str, ModelSpec> {
     static MODELS: OnceLock<HashMap<&'static str, ModelSpec>> = OnceLock::new();
     MODELS.get_or_init(|| {
         let mut m = HashMap::new();
+        // Three sizes of the same large-v3 family, because the trade-off is
+        // real in both directions: q5_0 is a 5-bit quantization of the turbo
+        // weights — it loads faster and costs a third of the memory, and it
+        // does lose accuracy, mostly on proper nouns and numbers. The f16
+        // files are what whisper.cpp calls "full"; on Apple Silicon they run
+        // straight through Metal at no meaningful penalty per audio second,
+        // so the price is disk and RAM, not speed.
         m.insert(
             "whisper-turbo",
             ModelSpec {
-                display_name: "Whisper large-v3 Turbo q5 (multilingual, ~547MB)",
+                display_name: "Whisper large-v3 Turbo q5 — klein und schnell (multilingual, ~574MB)",
                 url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
-                size_mb: 547,
+                size_mb: 574,
                 multilingual: true,
                 backend: Backend::WhisperCpp {
                     file_name: "ggml-large-v3-turbo-q5_0.bin",
+                },
+            },
+        );
+        m.insert(
+            "whisper-turbo-f16",
+            ModelSpec {
+                display_name: "Whisper large-v3 Turbo f16 — unquantisiert (multilingual, ~1,6GB)",
+                url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
+                size_mb: 1624,
+                multilingual: true,
+                backend: Backend::WhisperCpp {
+                    file_name: "ggml-large-v3-turbo.bin",
+                },
+            },
+        );
+        // Turbo is large-v3 with the decoder cut from 32 layers to 4. That is
+        // where its speed comes from, and also the only thing this model does
+        // better: the full large-v3 decodes several times slower, but nothing
+        // in the whisper family transcribes German more accurately.
+        m.insert(
+            "whisper-large-v3",
+            ModelSpec {
+                display_name: "Whisper large-v3 f16 — höchste Genauigkeit, langsam (multilingual, ~3,1GB)",
+                url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin",
+                size_mb: 3095,
+                multilingual: true,
+                backend: Backend::WhisperCpp {
+                    file_name: "ggml-large-v3.bin",
                 },
             },
         );
@@ -143,15 +178,18 @@ pub fn available_models() -> &'static HashMap<&'static str, ModelSpec> {
                 },
             },
         );
-        // NVIDIA NeMo Parakeet TDT 0.6B v3 int8 — English only.
+        // NVIDIA NeMo Parakeet TDT 0.6B v3 int8 — multilingual: 25 European
+        // languages including German (German 5.04% WER on FLEURS, better than
+        // its own average). The v2 model this catalog entry was cloned from
+        // was English-only; the "English" label was carried over by mistake.
         // sherpa-onnx tar.bz2 from k2-fsa GitHub releases.
         m.insert(
             "parakeet-v3",
             ModelSpec {
-                display_name: "NVIDIA Parakeet TDT 0.6B v3 int8 (English, ~464MB) — needs `sherpa` feature",
+                display_name: "NVIDIA Parakeet TDT 0.6b v3 int8 — recommended for German (25 languages, ~464MB, needs a `sherpa` build)",
                 url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2",
                 size_mb: 464,
-                multilingual: false,
+                multilingual: true,
                 backend: Backend::SherpaTransducer {
                     inner_dir: "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
                     encoder: "encoder.int8.onnx",
@@ -167,6 +205,17 @@ pub fn available_models() -> &'static HashMap<&'static str, ModelSpec> {
 
 /// Alias so callers can use the familiar name.
 pub use available_models as AVAILABLE_MODELS;
+
+/// Silero VAD (MIT) — a single ~2 MB `.onnx` used for speech-boundary
+/// segmentation, orthogonal to the STT backend. It is deliberately *not* a
+/// [`ModelSpec`]/[`Backend`] entry: it is never selected as a transcription
+/// model, it is a small fixed asset the meeting pipeline fetches once and
+/// reuses. Only usable at runtime in `sherpa`-feature builds (the VAD lives
+/// in the sherpa-onnx native lib); the download itself needs no feature.
+pub const VAD_MODEL_URL: &str =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
+const VAD_DIR: &str = "silero_vad";
+const VAD_FILE: &str = "silero_vad.onnx";
 
 pub struct ModelManager {
     models_dir: PathBuf,
@@ -294,6 +343,40 @@ impl ModelManager {
         }
         Ok(dir)
     }
+
+    /// On-disk path to the Silero VAD model (may not exist yet).
+    pub fn vad_model_path(&self) -> PathBuf {
+        self.models_dir.join(VAD_DIR).join(VAD_FILE)
+    }
+
+    pub fn is_vad_downloaded(&self) -> bool {
+        self.vad_model_path().is_file()
+    }
+
+    /// Download the Silero VAD model if it is not already present. Idempotent;
+    /// returns the model path. Safe to call on any build — the download needs
+    /// no native feature.
+    pub fn ensure_vad_model(
+        &self,
+        progress: Option<ProgressCallback>,
+    ) -> Result<PathBuf, ModelError> {
+        let dest = self.vad_model_path();
+        if dest.is_file() {
+            return Ok(dest);
+        }
+        let dir = dest.parent().unwrap_or(&self.models_dir).to_path_buf();
+        std::fs::create_dir_all(&dir).map_err(|source| ModelError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        let tmp = dir.join(format!("{VAD_FILE}.partial"));
+        download_file(VAD_MODEL_URL, &tmp, progress)?;
+        std::fs::rename(&tmp, &dest).map_err(|source| ModelError::Io {
+            path: dest.clone(),
+            source,
+        })?;
+        Ok(dest)
+    }
 }
 
 fn download_file(
@@ -400,4 +483,36 @@ fn extract_tar_bz2_stripping(
          (or other tar.bz2 sherpa-onnx models)"
             .into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A whisper entry whose `file_name` does not match the file its URL
+    /// points at downloads fine and is then reported as "nicht installiert"
+    /// forever, because [`ModelManager::is_downloaded`] looks for the name the
+    /// catalog claims. Cheap to get wrong when adding a model, invisible until
+    /// someone waits out a 3 GB download.
+    #[test]
+    fn whisper_file_names_match_their_urls() {
+        for (id, spec) in available_models() {
+            let Backend::WhisperCpp { file_name } = &spec.backend else {
+                continue;
+            };
+            let from_url = spec.url.rsplit('/').next().unwrap_or_default();
+            assert_eq!(&from_url, file_name, "{id}");
+        }
+    }
+
+    /// Two models sharing a `file_name` would be fine on disk (one directory
+    /// each) but means one of them is a copy-paste of the other.
+    #[test]
+    fn models_are_distinct() {
+        let mut urls: Vec<&str> = available_models().values().map(|s| s.url).collect();
+        let total = urls.len();
+        urls.sort_unstable();
+        urls.dedup();
+        assert_eq!(urls.len(), total, "duplicate model url in the catalog");
+    }
 }

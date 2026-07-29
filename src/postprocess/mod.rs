@@ -1,6 +1,9 @@
 //! LLM-based post-processing of transcripts.
 
 pub mod llm;
+pub mod refine;
+
+pub use refine::{refine, RefineJob};
 
 pub use llm::{
     fetch_openrouter_models, make_provider, resolve_system_prompt, LlmConfig, LlmError,

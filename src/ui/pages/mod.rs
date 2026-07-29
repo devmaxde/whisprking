@@ -5,5 +5,5 @@ pub mod meeting;
 pub mod settings;
 
 pub use history::HistoryPage;
-pub use meeting::MeetingPage;
+pub use meeting::{MeetingPage, MeetingState};
 pub use settings::SettingsPage;

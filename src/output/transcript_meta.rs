@@ -1,20 +1,60 @@
-//! Sidecar JSON next to each transcript `.md` recording whether the
-//! cleanup post-process has been run. Lives at `<stem>.meta.json`.
+//! Sidecar JSON next to each transcript `.md` recording which derived
+//! documents exist and when they were generated. Lives at `<stem>.meta.json`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Provenance of one derived document (cleanup, summary, …).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DocMeta {
+    /// Local timestamp the document was generated at.
+    #[serde(default)]
+    pub created_at: String,
+    /// Model id that produced it, if known.
+    #[serde(default)]
+    pub model: String,
+    /// Provider that produced it, if known.
+    #[serde(default)]
+    pub provider: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TranscriptMeta {
+    /// Derived documents by preset key (`cleanup`, `summary`, …).
+    #[serde(default)]
+    pub docs: BTreeMap<String, DocMeta>,
+
+    /// Legacy: set by builds that appended the cleanup into the transcript.
+    /// Kept so old sidecars keep parsing; nothing writes it any more.
     #[serde(default)]
     pub cleanup_ran: bool,
-    /// ISO-8601 local timestamp the cleanup completed at.
     #[serde(default)]
     pub cleanup_at: Option<String>,
-    /// Preset key used (e.g. `cleanup`, `summary`).
     #[serde(default)]
     pub cleanup_preset: Option<String>,
+}
+
+impl TranscriptMeta {
+    /// Note that `preset` has just been generated.
+    pub fn record_doc(&mut self, preset: &str, created_at: &str, model: &str, provider: &str) {
+        if preset.is_empty() {
+            return;
+        }
+        self.docs.insert(
+            preset.to_string(),
+            DocMeta {
+                created_at: created_at.to_string(),
+                model: model.to_string(),
+                provider: provider.to_string(),
+            },
+        );
+    }
+
+    pub fn forget_doc(&mut self, preset: &str) {
+        self.docs.remove(preset);
+    }
 }
 
 impl TranscriptMeta {
@@ -57,17 +97,31 @@ mod tests {
         let dir = tempdir().unwrap();
         let md = dir.path().join("2026-05-13_meeting.md");
         std::fs::write(&md, "body").unwrap();
-        let m = TranscriptMeta {
-            cleanup_ran: true,
-            cleanup_at: Some("2026-05-13T10:00:00".into()),
-            cleanup_preset: Some("cleanup".into()),
-        };
+        let mut m = TranscriptMeta::default();
+        m.record_doc("cleanup", "2026-05-13 10:00", "gpt", "openrouter");
         m.save(&md).unwrap();
+
         let loaded = TranscriptMeta::load(&md);
-        assert!(loaded.cleanup_ran);
-        assert_eq!(loaded.cleanup_preset.as_deref(), Some("cleanup"));
-        let meta_path = dir.path().join("2026-05-13_meeting.meta.json");
-        assert!(meta_path.is_file());
+        let doc = loaded.docs.get("cleanup").expect("recorded doc");
+        assert_eq!(doc.created_at, "2026-05-13 10:00");
+        assert_eq!(doc.provider, "openrouter");
+        assert!(dir.path().join("2026-05-13_meeting.meta.json").is_file());
+    }
+
+    /// Sidecars written by builds that appended the cleanup into the
+    /// transcript must keep parsing.
+    #[test]
+    fn legacy_sidecar_still_parses() {
+        let dir = tempdir().unwrap();
+        let md = dir.path().join("old.md");
+        std::fs::write(
+            dir.path().join("old.meta.json"),
+            r#"{"cleanup_ran": true, "cleanup_at": "2026-05-13T10:00:00", "cleanup_preset": "cleanup"}"#,
+        )
+        .unwrap();
+        let m = TranscriptMeta::load(&md);
+        assert!(m.cleanup_ran);
+        assert!(m.docs.is_empty());
     }
 
     #[test]
@@ -75,6 +129,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let md = dir.path().join("nope.md");
         let m = TranscriptMeta::load(&md);
-        assert!(!m.cleanup_ran);
+        assert!(m.docs.is_empty());
     }
 }

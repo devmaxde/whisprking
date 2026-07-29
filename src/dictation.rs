@@ -9,9 +9,10 @@
 //! `Send + Sync`, so it satisfies the `HotkeyHandler` bounds without
 //! resorting to `unsafe impl Send`.
 
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crate::audio::recorder::{AudioRecorder, SAMPLE_RATE};
 use crate::config::Config;
@@ -19,6 +20,12 @@ use crate::hotkey::listener::HotkeyHandler;
 use crate::output::smart_paste::smart_paste;
 use crate::postprocess::llm::{make_provider, resolve_system_prompt, LlmConfig};
 use crate::transcription::engine::Transcriber;
+use crate::ui::overlay::{DictationStatus, OverlayState};
+
+/// How often the level meter behind the overlay is refreshed while
+/// recording. 30 Hz — the recorder already smooths the RMS, so this only
+/// has to be fast enough to look continuous.
+const LEVEL_TICK: Duration = Duration::from_millis(33);
 
 #[derive(Debug)]
 enum Cmd {
@@ -36,20 +43,43 @@ pub struct DictationHandle {
 }
 
 impl DictationHandle {
-    pub fn spawn(config: Arc<Mutex<Config>>, engine: Option<Arc<dyn Transcriber>>) -> Self {
+    pub fn spawn(
+        config: Arc<Mutex<Config>>,
+        engine: Option<Arc<dyn Transcriber>>,
+        status: DictationStatus,
+    ) -> Self {
         let (tx, rx) = mpsc::channel::<Cmd>();
         let join = thread::Builder::new()
             .name("whisprking-dictation".into())
             .spawn(move || {
                 log::info!("dictation worker thread alive");
-                let mut state = WorkerState::new(engine, config);
-                while let Ok(cmd) = rx.recv() {
+                let mut state = WorkerState::new(engine, config, status);
+                loop {
+                    // While recording we can't just block on the channel:
+                    // the overlay's level meter is fed from here, and the
+                    // only other thing that would wake us is the release.
+                    let cmd = if state.recording {
+                        match rx.recv_timeout(LEVEL_TICK) {
+                            Ok(cmd) => cmd,
+                            Err(RecvTimeoutError::Timeout) => {
+                                state.publish_level();
+                                continue;
+                            },
+                            Err(RecvTimeoutError::Disconnected) => break,
+                        }
+                    } else {
+                        match rx.recv() {
+                            Ok(cmd) => cmd,
+                            Err(_) => break,
+                        }
+                    };
                     match cmd {
                         Cmd::Press => state.on_press(),
                         Cmd::Release => state.on_release(),
                         Cmd::Shutdown => break,
                     }
                 }
+                state.status.set_state(OverlayState::Hidden);
                 log::info!("dictation worker thread exiting");
             })
             .expect("spawn dictation worker");
@@ -86,17 +116,28 @@ struct WorkerState {
     recorder: AudioRecorder,
     engine: Option<Arc<dyn Transcriber>>,
     config: Arc<Mutex<Config>>,
+    status: DictationStatus,
     recording: bool,
 }
 
 impl WorkerState {
-    fn new(engine: Option<Arc<dyn Transcriber>>, config: Arc<Mutex<Config>>) -> Self {
+    fn new(
+        engine: Option<Arc<dyn Transcriber>>,
+        config: Arc<Mutex<Config>>,
+        status: DictationStatus,
+    ) -> Self {
         Self {
             recorder: AudioRecorder::new(),
             engine,
             config,
+            status,
             recording: false,
         }
+    }
+
+    /// Hand the recorder's smoothed RMS to the overlay meter.
+    fn publish_level(&self) {
+        self.status.set_level(self.recorder.level());
     }
 
     fn on_press(&mut self) {
@@ -106,7 +147,10 @@ impl WorkerState {
         }
         log::info!("dictation: starting capture");
         match self.recorder.start() {
-            Ok(()) => self.recording = true,
+            Ok(()) => {
+                self.recording = true;
+                self.status.set_state(OverlayState::Recording);
+            }
             Err(e) => log::error!("dictation: recorder.start() failed: {e}"),
         }
     }
@@ -117,6 +161,26 @@ impl WorkerState {
             return;
         }
         self.recording = false;
+        self.status.set_level(0.0);
+        self.status.set_state(OverlayState::Transcribing);
+
+        let text = self.transcribe();
+
+        // Hide before pasting. The overlay is a real window, and the Cmd+V
+        // that follows goes to whatever macOS considers frontmost.
+        self.status.set_state(OverlayState::Hidden);
+
+        let Some(text) = text else { return };
+        match smart_paste(&text) {
+            Ok(true) => log::info!("dictation: pasted"),
+            Ok(false) => log::debug!("dictation: nothing to paste"),
+            Err(e) => log::error!("dictation: paste failed: {e}"),
+        }
+    }
+
+    /// Stop the recorder and turn what it captured into the text to paste.
+    /// `None` when there is nothing worth pasting.
+    fn transcribe(&mut self) -> Option<String> {
         let audio = self.recorder.stop();
         log::info!(
             "dictation: captured {} samples ({:.2}s)",
@@ -126,28 +190,23 @@ impl WorkerState {
 
         let Some(engine) = self.engine.clone() else {
             log::warn!("dictation: no engine loaded — discarding audio");
-            return;
+            return None;
         };
 
         let text = match engine.transcribe(&audio, SAMPLE_RATE) {
             Ok(t) => t.trim().to_string(),
             Err(e) => {
                 log::error!("dictation: transcription failed: {e}");
-                return;
+                return None;
             }
         };
         if text.is_empty() {
             log::info!("dictation: empty transcript");
-            return;
+            return None;
         }
         log::info!("dictation: transcribed {} chars", text.len());
 
-        let final_text = self.maybe_postprocess(&text);
-        match smart_paste(&final_text) {
-            Ok(true) => log::info!("dictation: pasted"),
-            Ok(false) => log::debug!("dictation: nothing to paste"),
-            Err(e) => log::error!("dictation: paste failed: {e}"),
-        }
+        Some(self.maybe_postprocess(&text))
     }
 
     fn maybe_postprocess(&self, text: &str) -> String {
@@ -168,9 +227,12 @@ impl WorkerState {
         if !autorun {
             return text.to_string();
         }
-        let Some(provider) = make_provider(&llm_cfg) else {
-            log::info!("dictation: autorun enabled but no provider available");
-            return text.to_string();
+        let provider = match make_provider(&llm_cfg) {
+            Ok(provider) => provider,
+            Err(e) => {
+                log::info!("dictation: autorun enabled but no provider available: {e}");
+                return text.to_string();
+            },
         };
         let system = resolve_system_prompt(&preset, &custom_prompt, &overrides);
         match provider.run(&system, text) {

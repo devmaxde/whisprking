@@ -22,17 +22,40 @@ use whisprking::dictation::DictationHandle;
 use whisprking::hotkey::listener::{HotkeyHandler, HotkeyListener};
 use whisprking::transcription::engine::{build_transcriber, Transcriber};
 use whisprking::transcription::model_manager::ModelManager;
+use whisprking::ui::overlay::DictationStatus;
 use whisprking::utils::permissions::{
     check_accessibility, check_microphone, prompt_for_accessibility, PermissionStatus,
 };
 
 fn main() -> Result<()> {
+    // Icon export runs before anything else: it must not load config, ask
+    // for Accessibility or open a window, because `just bundle` calls it on
+    // a build machine.
+    if let Some(code) = handle_icon_args() {
+        std::process::exit(code);
+    }
+
     init_logger();
     install_panic_hook();
 
     log::info!("WhisprKing starting (pid={})", std::process::id());
 
-    let config = Config::load_default()?;
+    let mut config = Config::load_default()?;
+
+    // Older builds routed system audio by creating public Core Audio
+    // devices and switching the system default output to one of them. That
+    // survived quitting the app, so undo it before doing anything else —
+    // a user who crashed mid-meeting is still routed through a device that
+    // belongs to a process that is no longer running.
+    #[cfg(target_os = "macos")]
+    {
+        let report = whisprking::audio::legacy::repair(&mut config);
+        if let Some(summary) = report.summary() {
+            log::warn!("{summary}");
+        }
+    }
+
+    let config = config;
     let data_dir = Config::resolve_data_dir(&config.data_dir);
     log::info!("config loaded — data_dir={}", data_dir.display());
     log::info!(
@@ -60,10 +83,15 @@ fn main() -> Result<()> {
     let engine: Option<Arc<dyn Transcriber>> = build_engine(&config);
     let config = Arc::new(Mutex::new(config));
 
+    // Shared between the dictation worker and the UI: the worker writes
+    // recording / transcribing, the UI paints the on-screen overlay from
+    // it. Created here because the worker starts before eframe does.
+    let status = DictationStatus::default();
+
     // Start the dictation pipeline + hotkey listener BEFORE eframe so the
     // rdev event tap is installed immediately; this is what surfaces the
     // Accessibility prompt and what makes key events actually flow.
-    let dictation = DictationHandle::spawn(Arc::clone(&config), engine.clone());
+    let dictation = DictationHandle::spawn(Arc::clone(&config), engine.clone(), status.clone());
     let handler: Arc<dyn HotkeyHandler> = Arc::new(dictation.clone());
 
     let hotkey_name = {
@@ -85,11 +113,45 @@ fn main() -> Result<()> {
         let g = config.lock().expect("config");
         g.clone()
     };
-    if let Err(e) = whisprking::ui::app::run(ui_config, ui_engine) {
+    if let Err(e) = whisprking::ui::app::run(ui_config, ui_engine, status) {
         log::error!("ui exited with error: {e}");
     }
 
     Ok(())
+}
+
+/// Handle `--write-icns <file>` / `--write-icon-pngs <dir>` and return the
+/// exit code, or `None` when the app was started normally.
+///
+/// The app icon is generated from the same code that draws the mark in the
+/// UI (`ui::brand`), so the bundle can never drift from what the app shows.
+fn handle_icon_args() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    let value = |flag: &str| -> Option<&String> {
+        args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1))
+    };
+
+    let result = if let Some(path) = value("--write-icns") {
+        whisprking::ui::brand::write_icns(std::path::Path::new(path)).map(|()| vec![path.clone()])
+    } else if let Some(dir) = value("--write-icon-pngs") {
+        whisprking::ui::brand::write_pngs(std::path::Path::new(dir))
+            .map(|paths| paths.iter().map(|p| p.display().to_string()).collect())
+    } else {
+        return None;
+    };
+
+    match result {
+        Ok(paths) => {
+            for path in paths {
+                println!("{path}");
+            }
+            Some(0)
+        }
+        Err(e) => {
+            eprintln!("icon export failed: {e}");
+            Some(1)
+        }
+    }
 }
 
 /// Catch panics from any thread (rdev callback, cpal callback, dictation
@@ -181,6 +243,40 @@ fn boxed_clone(engine: Arc<dyn Transcriber>) -> Box<dyn Transcriber> {
             sample_rate: u32,
         ) -> Result<String, whisprking::transcription::engine::EngineError> {
             self.0.transcribe(audio, sample_rate)
+        }
+        // Every method has to be forwarded, not just the ones that look
+        // interesting: each one has a default, so a missing forward compiles
+        // fine and silently answers for whisper no matter what is behind the
+        // Arc. That is how the meeting path would lose carryover and the
+        // language pin, and how the post pass would pack a transducer into
+        // whisper-sized windows.
+        fn transcribe_with_context(
+            &self,
+            audio: &[f32],
+            sample_rate: u32,
+            cx: whisprking::transcription::engine::DecodeContext<'_>,
+        ) -> Result<String, whisprking::transcription::engine::EngineError> {
+            self.0.transcribe_with_context(audio, sample_rate, cx)
+        }
+
+        fn transcribe_timed(
+            &self,
+            audio: &[f32],
+            sample_rate: u32,
+            cx: whisprking::transcription::engine::DecodeContext<'_>,
+        ) -> Result<
+            Vec<whisprking::transcription::engine::TimedPiece>,
+            whisprking::transcription::engine::EngineError,
+        > {
+            self.0.transcribe_timed(audio, sample_rate, cx)
+        }
+
+        fn max_input_seconds(&self) -> f64 {
+            self.0.max_input_seconds()
+        }
+
+        fn backend_label(&self) -> &'static str {
+            self.0.backend_label()
         }
     }
     Box::new(Adaptor(engine))

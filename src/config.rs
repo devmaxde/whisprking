@@ -49,36 +49,119 @@ pub struct DictationConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeetingConfig {
+    /// Which side(s) to record: `"mic"`, `"system"`, or `"both"`.
+    ///
+    /// The legacy value `"mix"` is accepted and treated as `"both"`.
     pub audio_source: String,
     /// cpal-side input device name. `None` → use the system default input.
+    ///
+    /// This is the user's choice and only the user changes it. Nothing in
+    /// the capture path is allowed to write here — doing exactly that is
+    /// what used to silently hijack the microphone selection.
     #[serde(default)]
     pub input_device: Option<String>,
     pub model: String,
+    /// Language spoken in meetings. Three cases:
+    ///
+    /// - `""` (default) — follow [`DictationConfig::language`], i.e. whatever
+    ///   the shared engine was built with. Preserves pre-existing behaviour.
+    /// - `"auto"` — detect per segment, independently of dictation.
+    /// - an ISO code like `"de"` — pin it.
+    ///
+    /// Worth its own setting because a meeting is decoded segment-by-segment
+    /// and `auto` re-detects on every one of them, so a single English
+    /// loanword in a German sentence can flip whisper into *translating* the
+    /// rest of the call. Pinning here stops that without forcing the same
+    /// choice on dictation.
+    #[serde(default)]
+    pub language: String,
     pub save_audio: bool,
     pub chunk_duration_seconds: u32,
-    /// Live state of the BlackHole multi-output + aggregate-input pair we
-    /// created. All fields empty means "nothing set up".
+    /// Label each transcript line with which side spoke.
+    #[serde(default = "default_true")]
+    pub label_speakers: bool,
+    /// Second transcription pass over the saved audio once a meeting ends.
     #[serde(default)]
+    pub post_transcribe: PostTranscribeConfig,
+    /// Leftover state from the BlackHole era. Read once at startup so the
+    /// routing it describes can be torn down, then cleared for good; see
+    /// [`crate::audio::legacy`].
+    #[serde(default, skip_serializing_if = "BlackHoleSetup::is_empty")]
     pub blackhole: BlackHoleSetup,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+fn default_true() -> bool {
+    true
+}
+
+/// What happens after the recording stops.
+///
+/// The live transcript is decoded under real-time pressure, one short span at
+/// a time. This runs the same audio again with none of that: the largest
+/// window each backend accepts, and as many models as the user wants, in
+/// parallel. See [`crate::transcription::post`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostTranscribeConfig {
+    pub enabled: bool,
+    /// Models to run over the recording, in preference order. The first one
+    /// that produces a transcript is what gets used if the variants cannot be
+    /// merged. Anything not downloaded is skipped with a note.
+    pub models: Vec<String>,
+    /// Merge the variants into one transcript with the configured LLM. Off, or
+    /// with no provider, the best single variant becomes the result.
+    pub reconcile: bool,
+    /// Keep the per-track WAVs after the pass. They are what makes a re-run
+    /// possible, and they are large — roughly 115 MB per hour per track.
+    pub keep_audio: bool,
+}
+
+impl Default for PostTranscribeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // The two best German models in the catalog, one per backend, so
+            // they genuinely run side by side rather than queueing behind each
+            // other on the same accelerator.
+            models: vec!["whisper-large-v3".into(), "parakeet-v3".into()],
+            reconcile: true,
+            keep_audio: true,
+        }
+    }
+}
+
+/// Deprecated. Retained only so the cleanup pass can find and undo what an
+/// older version left behind on the user's machine.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlackHoleSetup {
     /// `true` while our created devices are alive in the HAL.
+    #[serde(default)]
     pub configured: bool,
     /// CoreAudio UID of the mic we mixed in.
+    #[serde(default)]
     pub mic_uid: String,
     /// CoreAudio UID of the speakers we routed system audio through.
+    #[serde(default)]
     pub speaker_uid: String,
     /// UID of the Multi-Output Device we created (Speakers + BlackHole).
+    #[serde(default)]
     pub output_uid: String,
     /// UID of the Aggregate Device we created (BlackHole + Mic).
+    #[serde(default)]
     pub input_uid: String,
-    /// UID of whatever the default output was before we switched it, so we
-    /// can restore on reset.
+    /// UID of whatever the default output was before we switched it — the
+    /// one piece of this struct that still matters, because it is how the
+    /// user gets their speakers back.
+    #[serde(default)]
     pub previous_default_output_uid: String,
-    /// cpal device name of the aggregate input — what the recorder uses.
+    /// cpal device name of the aggregate input.
+    #[serde(default)]
     pub input_device_name: String,
+}
+
+impl BlackHoleSetup {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,11 +191,14 @@ impl Default for Config {
                 insert_method: "smart_paste".into(),
             },
             meeting: MeetingConfig {
-                audio_source: "mix".into(),
+                audio_source: "both".into(),
                 input_device: None,
                 model: "whisper-turbo".into(),
+                language: String::new(),
                 save_audio: false,
                 chunk_duration_seconds: 10,
+                label_speakers: true,
+                post_transcribe: PostTranscribeConfig::default(),
                 blackhole: BlackHoleSetup::default(),
             },
             ai_postprocess: AiPostprocessConfig {
@@ -274,5 +360,21 @@ mod tests {
         // defaults filled in
         assert_eq!(cfg.dictation.model, "whisper-turbo");
         assert_eq!(cfg.meeting.chunk_duration_seconds, 10);
+    }
+
+    /// A config written before meetings had their own language must keep
+    /// behaving exactly as it did: empty means "follow dictation".
+    #[test]
+    fn meeting_language_defaults_to_following_dictation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"dictation": {"language": "de"}, "meeting": {"model": "whisper-turbo"}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load(path).unwrap();
+        assert_eq!(cfg.dictation.language, "de");
+        assert_eq!(cfg.meeting.language, "");
     }
 }

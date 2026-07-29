@@ -5,8 +5,8 @@
 //! main loop to poll.
 //!
 //! State changes (idle / recording / transcribing / meeting) recolor the
-//! microphone icon. The icon is drawn programmatically into an RGBA buffer
-//! so we ship no asset files.
+//! icon. It is the same crowned microphone as the app icon, rasterized from
+//! [`super::brand`] — no asset files, and one place to change the artwork.
 
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -14,8 +14,10 @@ use std::sync::{Arc, Mutex};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-use super::styles;
+use super::{brand, theme};
 
+/// Menu bar height on macOS is 22 pt; the icon is drawn at that size and
+/// anti-aliased into it.
 const ICON_SIZE: u32 = 22;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,14 +38,13 @@ impl TrayState {
         }
     }
 
-    fn color(self) -> [u8; 4] {
-        let c = match self {
-            TrayState::Idle => styles::TEXT_PRIMARY,
-            TrayState::Recording => styles::ACCENT_RED,
-            TrayState::Transcribing => styles::ACCENT_BLUE,
-            TrayState::Meeting => styles::ACCENT_GREEN,
-        };
-        [c.r(), c.g(), c.b(), 255]
+    fn color(self) -> egui::Color32 {
+        match self {
+            TrayState::Idle => theme::TEXT_PRIMARY,
+            TrayState::Recording => theme::DANGER,
+            TrayState::Transcribing => theme::ACCENT_HOVER,
+            TrayState::Meeting => theme::SUCCESS,
+        }
     }
 }
 
@@ -74,8 +75,8 @@ impl TrayHandle {
         let title = MenuItem::new("WhisprKing", false, None);
         let status = MenuItem::new(format!("Status: {}", TrayState::Idle.label()), false, None);
         let show = MenuItem::new("Fenster zeigen", true, None);
-        let meeting = MenuItem::new("Meeting starten…", true, None);
-        let settings = MenuItem::new("Einstellungen…", true, None);
+        let meeting = MenuItem::new("Meeting starten", true, None);
+        let settings = MenuItem::new("Einstellungen", true, None);
         let quit = MenuItem::new("Beenden", true, None);
 
         menu.append(&title)?;
@@ -129,9 +130,14 @@ impl TrayHandle {
         })
     }
 
+    /// Idempotent: the UI calls this every frame, and each real change
+    /// rasterizes a new icon.
     pub fn set_state(&self, state: TrayState) {
         {
             let mut guard = self.state.lock().expect("tray state");
+            if *guard == state {
+                return;
+            }
             *guard = state;
         }
         let _ = self.icon.set_icon(Some(make_mic_icon(state.color())));
@@ -150,79 +156,8 @@ impl TrayHandle {
     }
 }
 
-/// Render the microphone glyph used in the menu bar. Programmatic — no
-/// asset files in the repo.
-fn make_mic_icon(rgba: [u8; 4]) -> Icon {
-    let size = ICON_SIZE as i32;
-    let mut buf = vec![0u8; (ICON_SIZE * ICON_SIZE * 4) as usize];
-
-    let cx = size as f32 / 2.0;
-    let cy = size as f32 * 0.42;
-    let capsule_w = size as f32 * 0.42;
-    let capsule_h = size as f32 * 0.55;
-    let radius = capsule_w / 2.0;
-
-    for y in 0..size {
-        for x in 0..size {
-            let fx = x as f32 + 0.5;
-            let fy = y as f32 + 0.5;
-            let mut alpha = 0u8;
-
-            if in_capsule(fx, fy, cx, cy, capsule_w, capsule_h, radius) {
-                alpha = 255;
-            }
-
-            // stem
-            let stem_top = cy + capsule_h * 0.55;
-            let stem_bot = size as f32 * 0.88;
-            if fx >= cx - 0.9 && fx <= cx + 0.9 && fy >= stem_top && fy <= stem_bot {
-                alpha = 255;
-            }
-            // base bar
-            if fx >= cx - size as f32 * 0.18
-                && fx <= cx + size as f32 * 0.18
-                && (fy - stem_bot).abs() < 1.0
-            {
-                alpha = 255;
-            }
-
-            let idx = ((y * size + x) * 4) as usize;
-            if alpha > 0 {
-                buf[idx] = rgba[0];
-                buf[idx + 1] = rgba[1];
-                buf[idx + 2] = rgba[2];
-                buf[idx + 3] = alpha;
-            }
-        }
-    }
-    Icon::from_rgba(buf, ICON_SIZE, ICON_SIZE).expect("valid rgba")
-}
-
-fn in_capsule(fx: f32, fy: f32, cx: f32, cy: f32, w: f32, h: f32, r: f32) -> bool {
-    let left = cx - w / 2.0;
-    let right = cx + w / 2.0;
-    let top = cy - h / 2.0 + r;
-    let bot = cy + h / 2.0 - r;
-    // central rectangle
-    if fx >= left && fx <= right && fy >= top && fy <= bot {
-        return true;
-    }
-    // top cap
-    let top_dy = (fy - top).abs();
-    if fy < top && fx >= left && fx <= right && top_dy <= r {
-        let dx = fx - cx;
-        let dy = fy - top;
-        if dx * dx + dy * dy <= r * r {
-            return true;
-        }
-    }
-    // bottom cap
-    if fy > bot && fx >= left && fx <= right {
-        let dx = fx - cx;
-        let dy = fy - bot;
-        if dx * dx + dy * dy <= r * r {
-            return true;
-        }
-    }
-    false
+/// Rasterize the mark for the menu bar in the color of the current state.
+fn make_mic_icon(color: egui::Color32) -> Icon {
+    let rgba = brand::mark_rgba(ICON_SIZE, color, brand::MENUBAR_MARGIN);
+    Icon::from_rgba(rgba, ICON_SIZE, ICON_SIZE).expect("valid rgba")
 }

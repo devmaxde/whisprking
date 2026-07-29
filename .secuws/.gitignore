@@ -1,0 +1,8 @@
+# secuws — auto-generated. The `.secuws/` dir holds ephemeral runtime state: the
+# private SSH key, control/forward sockets, the pinned host fingerprint, and the
+# mutagen daemon's data. None of it belongs in git. Only the manifests are tracked.
+*
+!.gitignore
+!setup.toml
+!forwards.toml
+!syncignore

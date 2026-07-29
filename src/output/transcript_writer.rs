@@ -12,7 +12,7 @@ use chrono::{DateTime, Local};
 use regex::Regex;
 use thiserror::Error;
 
-const DURATION_PLACEHOLDER: &str = "_(läuft …)_";
+const DURATION_PLACEHOLDER: &str = "_(in progress …)_";
 
 #[derive(Debug, Error)]
 pub enum WriterError {
@@ -56,7 +56,7 @@ impl TranscriptWriter {
         let header = format!(
             "# {title}\n\n\
              - **Start:** {start}\n\
-             - **Dauer:** {placeholder}\n\n\
+             - **Duration:** {placeholder}\n\n\
              ---\n\n",
             title = title.unwrap_or("Meeting"),
             start = now.format("%Y-%m-%d %H:%M"),
@@ -74,12 +74,29 @@ impl TranscriptWriter {
 
     /// Append one timestamped segment to the active transcript.
     pub fn add_segment(&self, elapsed_seconds: f64, text: &str) -> Result<(), WriterError> {
+        self.add_labeled_segment(elapsed_seconds, None, text)
+    }
+
+    /// Append one timestamped segment, optionally attributed to a speaker.
+    ///
+    /// Meetings capture the microphone and the system output as separate
+    /// tracks, so we know which side of the call each segment came from
+    /// without running diarization over the audio.
+    pub fn add_labeled_segment(
+        &self,
+        elapsed_seconds: f64,
+        speaker: Option<&str>,
+        text: &str,
+    ) -> Result<(), WriterError> {
         let path = self.path.as_ref().ok_or(WriterError::NotStarted)?;
         let text = text.trim();
         if text.is_empty() {
             return Ok(());
         }
-        let line = format!("**[{}]** {}\n\n", fmt_mmss(elapsed_seconds), text);
+        let line = match speaker {
+            Some(s) => format!("**[{}] {}:** {}\n\n", fmt_mmss(elapsed_seconds), s, text),
+            None => format!("**[{}]** {}\n\n", fmt_mmss(elapsed_seconds), text),
+        };
         let mut f = OpenOptions::new()
             .append(true)
             .open(path)
@@ -104,8 +121,8 @@ impl TranscriptWriter {
             source,
         })?;
         let replaced = content.replace(
-            &format!("- **Dauer:** {}", DURATION_PLACEHOLDER),
-            &format!("- **Dauer:** {}", fmt_hhmmss(total_duration_seconds)),
+            &format!("- **Duration:** {}", DURATION_PLACEHOLDER),
+            &format!("- **Duration:** {}", fmt_hhmmss(total_duration_seconds)),
         );
         std::fs::write(path, replaced).map_err(|source| WriterError::Io {
             path: path.clone(),
@@ -153,12 +170,15 @@ mod tests {
         let path = w.start_new(Some("Standup 13.04.")).unwrap().to_path_buf();
         w.add_segment(0.0, "Guten Morgen alle.").unwrap();
         w.add_segment(12.5, "Wir starten mit den Updates.").unwrap();
+        w.add_labeled_segment(30.0, Some("Others"), "Klingt gut.")
+            .unwrap();
         w.finalize(125.0).unwrap();
 
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.contains("**[00:00]** Guten Morgen alle."));
         assert!(body.contains("**[00:12]** Wir starten mit den Updates."));
-        assert!(body.contains("- **Dauer:** 0h 02m 05s"));
+        assert!(body.contains("- **Duration:** 0h 02m 05s"));
+        assert!(body.contains("**[00:30] Others:** Klingt gut."));
         assert!(!body.contains(DURATION_PLACEHOLDER));
     }
 

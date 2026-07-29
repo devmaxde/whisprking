@@ -1,0 +1,31 @@
+# secuws sync ignore list — gitignore syntax. This file is the source of truth
+# for what does NOT sync to the VM; edit it freely (mutagen can't hot-reload, so
+# run `secuws sync restart` to apply). A bare pattern ignores a path; `!pattern`
+# re-includes one that .gitignore hides (e.g. a dev env file). `.git`/`.secuws`
+# can never be re-included. The entries below are seeded regenerable defaults —
+# delete any your project actually tracks.
+target
+node_modules
+.next
+dist
+build
+.venv
+venv
+__pycache__
+.gradle
+vendor
+.mypy_cache
+.pytest_cache
+.turbo
+.parcel-cache
+coverage
+.terraform
+Pods
+DerivedData
+bin
+obj
+.tox
+elm-stuff
+.cargo
+.idea
+.DS_Store
