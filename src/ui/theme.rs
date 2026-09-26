@@ -389,7 +389,6 @@ fn style_overrides(style: &mut egui::Style) {
     v.indent_has_left_vline = false;
     v.striped = false;
     v.disabled_alpha = 0.45;
-    v.clip_rect_margin = 0.0;
     v.resize_corner_size = 12.0;
 
     let w = &mut v.widgets;

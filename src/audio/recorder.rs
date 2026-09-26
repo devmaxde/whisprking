@@ -29,14 +29,11 @@ pub enum RecorderError {
     DeviceNotFound(String),
     #[error("no default input device")]
     NoInputDevice,
-    #[error("device error: {0}")]
-    Device(#[from] cpal::DevicesError),
-    #[error("default config error: {0}")]
-    Config(#[from] cpal::DefaultStreamConfigError),
-    #[error("build stream error: {0}")]
-    BuildStream(#[from] cpal::BuildStreamError),
-    #[error("play stream error: {0}")]
-    PlayStream(#[from] cpal::PlayStreamError),
+    // cpal 0.18 collapsed its per-operation error enums into one `cpal::Error`
+    // carrying an `ErrorKind`, so device enumeration, config query, stream
+    // build and stream play all funnel through this variant.
+    #[error("audio device error: {0}")]
+    Cpal(#[from] cpal::Error),
     #[error("unsupported sample format: {0:?}")]
     UnsupportedSampleFormat(SampleFormat),
 }
@@ -272,7 +269,7 @@ where
     let err = |e| log::error!("audio stream error: {e:?}");
 
     let stream = device.build_input_stream(
-        config,
+        config.clone(),
         move |data: &[T], _: &_| {
             if shared.paused.load(Ordering::SeqCst) {
                 return;

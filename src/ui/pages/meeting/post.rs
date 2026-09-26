@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::audio::capture::Track;
 use crate::config::Config;
+use crate::transcription::diarize::DiarizeSpec;
 use crate::transcription::model_manager::ModelManager;
 use crate::transcription::post::{run_post, PostPhase, PostSpec, ReconcileSpec};
 
@@ -28,6 +29,7 @@ impl PostJob {
         matches!(
             self.phase(),
             Some(PostPhase::Preparing)
+                | Some(PostPhase::Diarizing)
                 | Some(PostPhase::Transcribing(_))
                 | Some(PostPhase::Reconciling)
         )
@@ -65,8 +67,12 @@ impl PostJob {
         let phase = Arc::clone(&self.phase);
         let worker_ctx = ctx.clone();
         let keep_audio = config.meeting.post_transcribe.keep_audio;
+        let models_dir = Config::models_dir(config);
 
         std::thread::spawn(move || {
+            if spec.diarize.is_some() {
+                ensure_diarize_models(&models_dir);
+            }
             if let Err(e) = run_post(&spec, &phase) {
                 log::warn!("post: {e}");
                 *phase.lock().expect("post phase") = Some(PostPhase::Error(e));
@@ -112,7 +118,65 @@ pub fn spec_from_config(
         chunk_seconds: config.meeting.chunk_duration_seconds.max(1),
         language: config.meeting.language.clone(),
         label_speakers: config.meeting.label_speakers,
+        diarize: diarize_spec(config),
         reconcile,
+    }
+}
+
+/// The diarization job, or `None` when it is switched off — or when the lines
+/// carry no speaker at all, in which case working out who spoke would be work
+/// nobody sees.
+///
+/// Not gated on the models being present: they are fetched by
+/// [`ensure_diarize_models`] when the pass starts, and a pass that finds them
+/// missing anyway says so instead of quietly dropping the names.
+pub fn diarize_spec(config: &Config) -> Option<DiarizeSpec> {
+    let diarize = &config.meeting.diarize;
+    if !diarize.enabled || !config.meeting.label_speakers {
+        return None;
+    }
+    let paths = ModelManager::new(Config::models_dir(config)).diarize_paths();
+    Some(DiarizeSpec {
+        segmentation: paths.segmentation,
+        embedding: paths.embedding,
+        speakers: diarize.speakers,
+        threshold: diarize.threshold,
+        threads: diarize_threads(),
+    })
+}
+
+/// Diarization runs before the transcription models are loaded, so for those
+/// few minutes it can have the machine. Two cores are left alone so the UI
+/// keeps painting.
+fn diarize_threads() -> i32 {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    cores.saturating_sub(2).clamp(2, 8) as i32
+}
+
+/// Fetch the two diarization models if they are missing. Blocking (~34 MB),
+/// and called from a worker that is about to spend minutes transcribing
+/// anyway. A failure is logged and left to the pass itself to report — the
+/// transcript is worth producing either way.
+pub fn ensure_diarize_models(models_dir: &std::path::Path) {
+    if cfg!(not(feature = "sherpa")) {
+        // Nothing in this build can run them, and the pass says so in its
+        // note. Downloading 34 MB to prove it would be rude.
+        log::info!("diarize: skipping model download — this build has no sherpa backend");
+        return;
+    }
+    let manager = ModelManager::new(models_dir);
+    if manager.is_diarize_downloaded() {
+        return;
+    }
+    match manager.ensure_diarize_models(None) {
+        Ok(paths) => log::info!(
+            "diarize: models ready ({}, {})",
+            paths.segmentation.display(),
+            paths.embedding.display()
+        ),
+        Err(e) => log::warn!("diarize: model download failed: {e}"),
     }
 }
 

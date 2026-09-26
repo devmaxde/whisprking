@@ -40,7 +40,7 @@ tempfile = "3"
 # Pure-Rust demuxer/decoder for imported meeting recordings (m4a/aac, mp3,
 # flac, ogg/vorbis, wav). No system libraries. Video is handled separately
 # by shelling out to `ffmpeg` when it is installed.
-symphonia = { version = "0.5", default-features = false, features = [
+symphonia = { version = "0.6", default-features = false, features = [
   "isomp4",
   "aac",
   "mp3",
@@ -52,7 +52,7 @@ symphonia = { version = "0.5", default-features = false, features = [
 ] }
 arboard = "3"
 rdev = "0.5"
-cpal = "0.17"
+cpal = "0.18"
 hound = "3.5"
 # Local whisper.cpp bindings. Metal acceleration on macOS by default.
 whisper-rs = { version = "0.16", default-features = false, features = [
@@ -66,18 +66,18 @@ tar = { version = "0.4", optional = true }
 bzip2 = { version = "0.6", optional = true }
 
 # GUI
-eframe = { version = "0.35", default-features = false, features = [
+eframe = { version = "0.36", default-features = false, features = [
   "default_fonts",
   "glow",
   "wayland",
   "x11",
 ] }
-egui = "0.35"
+egui = "0.36"
 tray-icon = "0.24"
 image = { version = "0.25", default-features = false, features = ["png"] }
 opener = "0.8"
 # Native file-open dialog for the "Import recording → Browse…" button.
-rfd = "0.15"
+rfd = "0.17"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.25"

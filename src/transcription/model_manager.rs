@@ -217,6 +217,40 @@ pub const VAD_MODEL_URL: &str =
 const VAD_DIR: &str = "silero_vad";
 const VAD_FILE: &str = "silero_vad.onnx";
 
+/// Speaker diarization needs two models, and like the VAD they are fixed
+/// assets rather than [`ModelSpec`] entries: neither is ever selected as a
+/// transcription model, and one is useless without the other.
+///
+/// * **pyannote segmentation 3.0** — finds speech and marks where the voice
+///   changes. Shipped as a `.tar.bz2` with the same layout as the transducer
+///   packs, so it is extracted the same way.
+/// * **3D-Speaker CAM++** — turns a stretch of speech into a vector that can
+///   be clustered. Trained on Chinese *and* English data, which is the widest
+///   coverage among the small embedding models sherpa-onnx publishes; the
+///   embedding compares voices rather than words, so the language of the
+///   meeting barely matters.
+///
+/// Both are only usable at runtime in `sherpa`-feature builds. Together they
+/// are around [`DIARIZE_SIZE_MB`] on disk.
+pub const DIARIZE_SEGMENTATION_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2";
+const DIARIZE_SEGMENTATION_DIR: &str = "pyannote_segmentation";
+const DIARIZE_SEGMENTATION_INNER: &str = "sherpa-onnx-pyannote-segmentation-3-0";
+const DIARIZE_SEGMENTATION_FILE: &str = "model.onnx";
+// The release tag really is spelled "recongition" upstream.
+pub const DIARIZE_EMBEDDING_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx";
+const DIARIZE_EMBEDDING_DIR: &str = "speaker_embedding";
+const DIARIZE_EMBEDDING_FILE: &str = "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx";
+
+/// Combined on-disk size of the two diarization models, for the UI.
+pub const DIARIZE_SIZE_MB: u32 = 34;
+
+/// The pair of models [`crate::transcription::diarize`] loads.
+#[derive(Debug, Clone)]
+pub struct DiarizePaths {
+    pub segmentation: PathBuf,
+    pub embedding: PathBuf,
+}
+
 pub struct ModelManager {
     models_dir: PathBuf,
 }
@@ -314,7 +348,7 @@ impl ModelManager {
     pub fn download(
         &self,
         model_name: &str,
-        progress: Option<ProgressCallback>,
+        mut progress: Option<ProgressCallback>,
     ) -> Result<PathBuf, ModelError> {
         if self.is_downloaded(model_name) {
             return Ok(self.model_path(model_name));
@@ -330,13 +364,13 @@ impl ModelManager {
             Backend::WhisperCpp { file_name } => {
                 let dest = dir.join(file_name);
                 let tmp = dir.join(format!("{file_name}.partial"));
-                download_file(spec.url, &tmp, progress)?;
+                download_file(spec.url, &tmp, progress.as_mut())?;
                 std::fs::rename(&tmp, &dest)
                     .map_err(|source| ModelError::Io { path: dest, source })?;
             }
             Backend::SherpaTransducer { inner_dir, .. } => {
                 let archive = dir.join("archive.tar.bz2.partial");
-                download_file(spec.url, &archive, progress)?;
+                download_file(spec.url, &archive, progress.as_mut())?;
                 extract_tar_bz2_stripping(&archive, &dir, inner_dir)?;
                 let _ = std::fs::remove_file(&archive);
             }
@@ -358,7 +392,7 @@ impl ModelManager {
     /// no native feature.
     pub fn ensure_vad_model(
         &self,
-        progress: Option<ProgressCallback>,
+        mut progress: Option<ProgressCallback>,
     ) -> Result<PathBuf, ModelError> {
         let dest = self.vad_model_path();
         if dest.is_file() {
@@ -370,19 +404,83 @@ impl ModelManager {
             source,
         })?;
         let tmp = dir.join(format!("{VAD_FILE}.partial"));
-        download_file(VAD_MODEL_URL, &tmp, progress)?;
+        download_file(VAD_MODEL_URL, &tmp, progress.as_mut())?;
         std::fs::rename(&tmp, &dest).map_err(|source| ModelError::Io {
             path: dest.clone(),
             source,
         })?;
         Ok(dest)
     }
+
+    /// On-disk paths of the two diarization models (they may not exist yet).
+    pub fn diarize_paths(&self) -> DiarizePaths {
+        DiarizePaths {
+            segmentation: self
+                .models_dir
+                .join(DIARIZE_SEGMENTATION_DIR)
+                .join(DIARIZE_SEGMENTATION_FILE),
+            embedding: self
+                .models_dir
+                .join(DIARIZE_EMBEDDING_DIR)
+                .join(DIARIZE_EMBEDDING_FILE),
+        }
+    }
+
+    pub fn is_diarize_downloaded(&self) -> bool {
+        let paths = self.diarize_paths();
+        paths.segmentation.is_file() && paths.embedding.is_file()
+    }
+
+    /// Download whichever of the two diarization models is missing.
+    /// Idempotent. `progress` is called for each file in turn, so it reports
+    /// two downloads, not one combined bar.
+    ///
+    /// Extraction of the segmentation pack needs the `sherpa` feature (that is
+    /// where the `.tar.bz2` support lives), which is also the only kind of
+    /// build that can run diarization at all.
+    pub fn ensure_diarize_models(
+        &self,
+        mut progress: Option<ProgressCallback>,
+    ) -> Result<DiarizePaths, ModelError> {
+        let paths = self.diarize_paths();
+
+        if !paths.segmentation.is_file() {
+            let dir = self.models_dir.join(DIARIZE_SEGMENTATION_DIR);
+            std::fs::create_dir_all(&dir).map_err(|source| ModelError::Io {
+                path: dir.clone(),
+                source,
+            })?;
+            let archive = dir.join("archive.tar.bz2.partial");
+            download_file(DIARIZE_SEGMENTATION_URL, &archive, progress.as_mut())?;
+            extract_tar_bz2_stripping(&archive, &dir, DIARIZE_SEGMENTATION_INNER)?;
+            let _ = std::fs::remove_file(&archive);
+            if !paths.segmentation.is_file() {
+                return Err(ModelError::FileMissing(paths.segmentation.clone()));
+            }
+        }
+
+        if !paths.embedding.is_file() {
+            let dir = self.models_dir.join(DIARIZE_EMBEDDING_DIR);
+            std::fs::create_dir_all(&dir).map_err(|source| ModelError::Io {
+                path: dir.clone(),
+                source,
+            })?;
+            let tmp = dir.join(format!("{DIARIZE_EMBEDDING_FILE}.partial"));
+            download_file(DIARIZE_EMBEDDING_URL, &tmp, progress.as_mut())?;
+            std::fs::rename(&tmp, &paths.embedding).map_err(|source| ModelError::Io {
+                path: paths.embedding.clone(),
+                source,
+            })?;
+        }
+
+        Ok(paths)
+    }
 }
 
 fn download_file(
     url: &str,
     dest: &Path,
-    mut progress: Option<ProgressCallback>,
+    mut progress: Option<&mut ProgressCallback>,
 ) -> Result<(), ModelError> {
     let mut response = reqwest::blocking::get(url)?.error_for_status()?;
     let total = response.content_length().unwrap_or(0);

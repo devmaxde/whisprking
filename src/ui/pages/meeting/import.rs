@@ -34,6 +34,7 @@ impl ImportJob {
         matches!(
             self.phase(),
             Some(ImportPhase::Decoding)
+                | Some(ImportPhase::Diarizing)
                 | Some(ImportPhase::Transcribing { .. })
                 | Some(ImportPhase::Summarizing)
         )
@@ -58,16 +59,24 @@ impl ImportJob {
         let language = config.meeting.language.clone();
         let transcripts_dir = Config::transcripts_dir(config);
         let summary = summary_spec(config);
+        // An imported file is one track with everyone on it, so telling the
+        // voices apart is the only way it gets speaker names at all.
+        let diarize = super::post::diarize_spec(config);
+        let models_dir = Config::models_dir(config);
         let phase = Arc::clone(&self.phase);
         let worker_ctx = ctx.clone();
 
         std::thread::spawn(move || {
+            if diarize.is_some() {
+                super::post::ensure_diarize_models(&models_dir);
+            }
             let result = run_import(
                 &path,
                 &engine,
                 &vad_model,
                 chunk_seconds,
                 &language,
+                diarize,
                 &transcripts_dir,
                 summary,
                 &phase,
@@ -114,8 +123,8 @@ pub fn hovering_file(ctx: &egui::Context) -> bool {
 pub fn first_dropped(ctx: &egui::Context) -> Option<PathBuf> {
     ctx.input(|i| {
         i.raw.dropped_files.iter().find_map(|f| {
-            let p = f.path.clone()?;
-            has_import_ext(&p).then_some(p)
+            let p = f.path();
+            has_import_ext(p).then(|| p.to_path_buf())
         })
     })
 }

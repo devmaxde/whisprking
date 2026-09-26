@@ -21,6 +21,12 @@
 //! * **Reconciliation.** The variants go to the LLM together, in batches
 //!   aligned on the recording clock, and it produces one transcript from the
 //!   places they agree and disagree.
+//! * **Speaker names.** Each track is diarized once
+//!   ([`crate::transcription::diarize`]) and every line is attributed to the
+//!   voice that spoke over it, so a call with four people on the "Andere"
+//!   track reads as Person 1 … Person 4 instead of one collective "Andere".
+//!   That, too, is only possible here: the voices are found by clustering the
+//!   whole recording, which cannot be done while it is still running.
 //!
 //! Nothing here ever writes to the live transcript. Results land in
 //! `<stem>.post.md` and `<stem>.post-variants.md`, the same
@@ -39,6 +45,7 @@ use crate::output::transcript_doc::{self, DocKind};
 use crate::output::transcript_meta::TranscriptMeta;
 use crate::postprocess::llm::{make_provider, resolve_system_prompt, LlmConfig};
 use crate::transcription::context::{carry_context, language_override};
+use crate::transcription::diarize::{self, DiarizeSpec, Diarizer, SpeakerNames, SpeakerSpan};
 use crate::transcription::engine::{build_transcriber, DecodeContext, SAMPLE_RATE};
 use crate::transcription::model_manager::ModelManager;
 use crate::transcription::pack;
@@ -80,6 +87,10 @@ pub struct PostSpec {
     pub chunk_seconds: u32,
     pub language: String,
     pub label_speakers: bool,
+    /// `None` keeps the track labels ("Du" / "Andere"). With a spec, each
+    /// track is split into the individual voices in it and the lines are
+    /// named after those instead.
+    pub diarize: Option<DiarizeSpec>,
     /// `None` disables reconciliation; the best single variant is then
     /// promoted to the post transcript.
     pub reconcile: Option<ReconcileSpec>,
@@ -130,6 +141,9 @@ impl ModelProgress {
 pub enum PostPhase {
     /// Reading the tracks back and finding speech boundaries.
     Preparing,
+    /// Working out how many people are on the recording, and where each of
+    /// them speaks.
+    Diarizing,
     Transcribing(Vec<ModelProgress>),
     Reconciling,
     Done {
@@ -158,6 +172,10 @@ fn set(progress: &Progress, phase: PostPhase) {
 pub struct Line {
     pub elapsed: f64,
     pub track: Track,
+    /// Which voice said it, once the recording has been diarized. `None`
+    /// falls back to the track's own label, which is what every line had
+    /// before diarization existed.
+    pub speaker: Option<String>,
     pub text: String,
 }
 
@@ -181,9 +199,10 @@ pub fn run_post(spec: &PostSpec, progress: &Progress) -> Result<PathBuf, String>
 
     let models = usable_models(spec)?;
 
-    // Segmentation does not depend on the model, so it happens once and every
-    // engine packs the same spans to its own window size.
-    let spans = segment_tracks(spec)?;
+    // Neither segmentation nor diarization depends on the model, so both
+    // happen once and every engine works from the same spans.
+    let prepared = prepare_tracks(spec, progress)?;
+    let spans = prepared.spans;
     let total_secs: f64 = spans
         .iter()
         .flat_map(|(_, s)| s.iter())
@@ -199,9 +218,12 @@ pub fn run_post(spec: &PostSpec, progress: &Progress) -> Result<PathBuf, String>
         models.join(", ")
     );
 
-    let runs = transcribe_all(spec, &models, Arc::new(spans), total_secs, progress);
+    let mut runs = transcribe_all(spec, &models, Arc::new(spans), total_secs, progress);
     if runs.is_empty() {
         return Err("Kein Modell konnte die Aufnahme transkribieren.".into());
+    }
+    for run in &mut runs {
+        label_lines(run, &prepared.voices, &prepared.names);
     }
 
     let title = read_title(&spec.transcript);
@@ -209,7 +231,10 @@ pub fn run_post(spec: &PostSpec, progress: &Progress) -> Result<PathBuf, String>
         .then(|| write_variants(spec, &title, &runs))
         .transpose()?;
 
-    let (body, note, model_label) = reconcile_or_pick(spec, &runs, progress);
+    let (body, note, mut model_label) = reconcile_or_pick(spec, &runs, progress);
+    if !prepared.names.is_empty() {
+        model_label.push_str(" + Sprechererkennung");
+    }
     let post = write_post(spec, &title, &body, &model_label)?;
 
     record_meta(spec, variants.is_some(), &model_label);
@@ -219,7 +244,7 @@ pub fn run_post(spec: &PostSpec, progress: &Progress) -> Result<PathBuf, String>
         PostPhase::Done {
             post: post.clone(),
             variants,
-            note,
+            note: join_notes(prepared.note, note),
         },
     );
     Ok(post)
@@ -267,12 +292,32 @@ fn is_sherpa(manager: &ModelManager, model: &str) -> bool {
 }
 
 // =====================================================================
-// Segmentation
+// Segmentation and diarization
 // =====================================================================
 
-/// Read every track back and cut it on speech boundaries.
-fn segment_tracks(spec: &PostSpec) -> Result<Vec<(Track, Vec<SpeechSpan>)>, String> {
-    let mut out = Vec::new();
+/// Everything that is derived from the audio alone, before any model runs.
+struct Prepared {
+    /// Per track, the spans of speech to transcribe.
+    spans: Vec<(Track, Vec<SpeechSpan>)>,
+    /// Per track, who was speaking when. Empty unless the recording was
+    /// diarized.
+    voices: Vec<(Track, Vec<SpeakerSpan>)>,
+    /// The name each voice gets in the transcript.
+    names: SpeakerNames,
+    /// Why there are no speaker names, when they were asked for.
+    note: Option<String>,
+}
+
+/// Read every track back once and get both things out of it: the speech spans
+/// to transcribe, and — when asked for — who is speaking in them.
+///
+/// One read per track, deliberately: the WAVs are around 115 MB per hour, and
+/// segmenting and diarizing from the same buffer costs nothing extra.
+fn prepare_tracks(spec: &PostSpec, progress: &Progress) -> Result<Prepared, String> {
+    let (diarizer, mut note) = load_diarizer(spec);
+
+    let mut spans_out = Vec::new();
+    let mut voices = Vec::new();
     for (track, path) in &spec.tracks {
         let samples = read_track(path).map_err(|e| e.to_string())?;
         let mut segmenter = Segmenter::new(Some(&spec.vad_model), spec.chunk_seconds);
@@ -292,14 +337,115 @@ fn segment_tracks(spec: &PostSpec) -> Result<Vec<(Track, Vec<SpeechSpan>)>, Stri
                 "fixed windows"
             },
         );
-        if !spans.is_empty() {
-            out.push((*track, spans));
+        if spans.is_empty() {
+            continue;
         }
+
+        if let Some(diarizer) = diarizer.as_ref() {
+            set(progress, PostPhase::Diarizing);
+            // A fixed count is a count for the call, and the call is on the
+            // system track. The microphone carries you plus whoever is in the
+            // room, so forcing the same number onto it would invent people.
+            diarizer.set_speakers(match track {
+                Track::Mic if spec.tracks.len() > 1 => 0,
+                _ => spec.diarize.as_ref().map(|d| d.speakers).unwrap_or(0),
+            });
+            match diarizer.run(&samples, SAMPLE_RATE) {
+                Ok(found) if !found.is_empty() => voices.push((*track, found)),
+                Ok(_) => log::info!("post: no voices found on {:?}", track),
+                Err(e) => {
+                    log::warn!("post: diarization of {track:?} failed: {e}");
+                    note.get_or_insert_with(|| {
+                        format!("Die Sprecher konnten nicht unterschieden werden ({e}).")
+                    });
+                },
+            }
+        }
+
+        spans_out.push((*track, spans));
     }
-    if out.is_empty() {
+    if spans_out.is_empty() {
         return Err("Die Aufnahme enthält keine Tonspur mit Sprache.".into());
     }
-    Ok(out)
+
+    let names = SpeakerNames::assign(&voices);
+    if names.count() > 0 {
+        log::info!("post: {} voice(s) across the recording", names.count());
+    }
+    Ok(Prepared {
+        spans: spans_out,
+        voices,
+        names,
+        note,
+    })
+}
+
+/// Load the diarization models, or explain why the transcript will keep the
+/// track labels. Never fails the pass: a transcript that says "Andere" is a
+/// great deal better than no transcript.
+fn load_diarizer(spec: &PostSpec) -> (Option<Diarizer>, Option<String>) {
+    let Some(diarize) = spec.diarize.as_ref() else {
+        return (None, None);
+    };
+    match Diarizer::load(diarize) {
+        Ok(d) => (Some(d), None),
+        Err(e) => {
+            log::warn!("post: diarization unavailable: {e}");
+            (
+                None,
+                Some(format!(
+                    "Die Sprecher wurden nicht unterschieden ({e}) — die Zeilen \
+                     tragen weiter „Du“ und „Andere“."
+                )),
+            )
+        },
+    }
+}
+
+/// Attribute every line to the voice that spoke over it.
+///
+/// A line has a start but no end — the transcriber reports when a piece began,
+/// not how long it ran — so the line is taken to last until the next line on
+/// the same track ([`diarize::line_end`]) and goes to whichever voice covers
+/// most of that stretch.
+fn label_lines(run: &mut ModelRun, voices: &[(Track, Vec<SpeakerSpan>)], names: &SpeakerNames) {
+    if voices.is_empty() {
+        return;
+    }
+    // Where the next line on the same track starts, per line. Walked
+    // backwards so each track's successor is known in one pass; the lines are
+    // interleaved across tracks and sorted by time.
+    let mut next: Vec<Option<f64>> = vec![None; run.lines.len()];
+    let mut following: Vec<(Track, f64)> = Vec::new();
+    for i in (0..run.lines.len()).rev() {
+        let (track, elapsed) = (run.lines[i].track, run.lines[i].elapsed);
+        match following.iter_mut().find(|(t, _)| *t == track) {
+            Some(entry) => {
+                next[i] = Some(entry.1);
+                entry.1 = elapsed;
+            },
+            None => following.push((track, elapsed)),
+        }
+    }
+
+    for (i, line) in run.lines.iter_mut().enumerate() {
+        let Some((_, spans)) = voices.iter().find(|(t, _)| *t == line.track) else {
+            continue;
+        };
+        let end = diarize::line_end(line.elapsed, next[i]);
+        line.speaker = diarize::speaker_at(spans, line.elapsed, end)
+            .and_then(|s| names.label(line.track, s))
+            .map(str::to_string);
+    }
+}
+
+/// Both halves of "why is this less than you asked for", in one paragraph.
+fn join_notes(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(format!("{a} {b}")),
+        (Some(one), None) | (None, Some(one)) => Some(one),
+        (None, None) => None,
+    }
 }
 
 // =====================================================================
@@ -426,6 +572,7 @@ fn run_one_model(
                         lines.push(Line {
                             elapsed: window.absolute(piece.offset),
                             track: *track,
+                            speaker: None,
                             text: text.to_string(),
                         });
                     }
@@ -492,12 +639,16 @@ pub fn fmt_mmss(seconds: f64) -> String {
 }
 
 /// One transcript line in the same shape the live writer uses.
+///
+/// The name is the diarized voice when there is one and the track's own label
+/// otherwise — so a recording that was not (or could not be) diarized reads
+/// exactly as it did before.
 fn fmt_line(line: &Line, label_speakers: bool) -> String {
     if label_speakers {
         format!(
             "**[{}] {}:** {}",
             fmt_mmss(line.elapsed),
-            line.track.label(),
+            line.speaker.as_deref().unwrap_or(line.track.label()),
             line.text
         )
     } else {
@@ -815,6 +966,7 @@ mod tests {
         Line {
             elapsed,
             track: Track::Mic,
+            speaker: None,
             text: text.to_string(),
         }
     }
@@ -834,6 +986,66 @@ mod tests {
         let l = line(72.0, "Guten Morgen.");
         assert_eq!(fmt_line(&l, true), "**[01:12] Du:** Guten Morgen.");
         assert_eq!(fmt_line(&l, false), "**[01:12]** Guten Morgen.");
+    }
+
+    /// The whole point of the diarization pass, end to end: a line that was
+    /// spoken by the second voice on the "Andere" track has to come out as
+    /// that person rather than as the track.
+    #[test]
+    fn speaker_names_replace_the_track_label() {
+        let voice = |start: f64, end: f64, speaker: u32| SpeakerSpan {
+            start,
+            end,
+            speaker,
+        };
+        let voices = vec![
+            (Track::Mic, vec![voice(0.0, 5.0, 0)]),
+            (Track::System, vec![voice(6.0, 9.0, 0), voice(10.0, 20.0, 1)]),
+        ];
+        let names = SpeakerNames::assign(&voices);
+
+        let mut run = run(
+            "whisper",
+            vec![
+                Line {
+                    elapsed: 1.0,
+                    track: Track::Mic,
+                    speaker: None,
+                    text: "Kurze Frage.".into(),
+                },
+                Line {
+                    elapsed: 6.5,
+                    track: Track::System,
+                    speaker: None,
+                    text: "Klar.".into(),
+                },
+                Line {
+                    elapsed: 11.0,
+                    track: Track::System,
+                    speaker: None,
+                    text: "Ich übernehme das.".into(),
+                },
+            ],
+        );
+        label_lines(&mut run, &voices, &names);
+
+        assert_eq!(fmt_line(&run.lines[0], true), "**[00:01] Du:** Kurze Frage.");
+        assert_eq!(fmt_line(&run.lines[1], true), "**[00:06] Person 1:** Klar.");
+        assert_eq!(
+            fmt_line(&run.lines[2], true),
+            "**[00:11] Person 2:** Ich übernehme das."
+        );
+        // Names are for the reader; switching labels off still drops them.
+        assert_eq!(fmt_line(&run.lines[1], false), "**[00:06]** Klar.");
+    }
+
+    /// A recording nobody could diarize has to read exactly as it did before
+    /// the feature existed.
+    #[test]
+    fn without_voices_the_lines_keep_their_track() {
+        let mut run = run("whisper", vec![line(3.0, "Guten Morgen.")]);
+        label_lines(&mut run, &[], &SpeakerNames::default());
+        assert_eq!(fmt_line(&run.lines[0], true), "**[00:03] Du:** Guten Morgen.");
     }
 
     /// Both variants of the same stretch have to end up in the same request,

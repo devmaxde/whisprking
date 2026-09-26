@@ -4,8 +4,15 @@
 //! [`crate::ui::pages::meeting`]. Instead of audio streaming in from two
 //! capture tracks, the whole file is decoded up front
 //! ([`super::decode::decode_to_mono_16k`]) and pushed through the *same*
-//! [`Segmenter`] → [`Transcriber`] → [`TranscriptWriter`] path. A file has
-//! no mic/system split, so it is a single, unlabelled track.
+//! [`Segmenter`] → [`Transcriber`] → [`TranscriptWriter`] path. A file is a
+//! single track.
+//!
+//! A file has no mic/system split, but it usually has several people in it,
+//! which is exactly the case speaker diarization exists for: with the models
+//! installed, the whole file is clustered into voices up front
+//! ([`crate::transcription::diarize`]) and every segment is written under the
+//! name of whoever spoke it — Person 1, Person 2, … in the order they are
+//! first heard.
 //!
 //! After transcription it optionally runs the LLM `summary` preset — the
 //! "drop in audio, get a summary" flow. The summary is written as its own
@@ -23,6 +30,7 @@ use crate::output::transcript_writer::TranscriptWriter;
 use crate::postprocess::llm::LlmConfig;
 use crate::postprocess::refine::{refine, RefineJob};
 use crate::transcription::context::{carry_context, language_override};
+use crate::transcription::diarize::{self, DiarizeSpec, Diarizer, SpeakerSpan};
 use crate::transcription::engine::{DecodeContext, Transcriber};
 
 /// How much decoded audio to hand the segmenter per step. Only affects how
@@ -34,6 +42,9 @@ const FEED_SAMPLES: usize = TARGET_RATE as usize; // 1 s
 #[derive(Debug, Clone)]
 pub enum ImportPhase {
     Decoding,
+    /// Working out how many people are in the recording, and where each of
+    /// them speaks.
+    Diarizing,
     /// Transcribing, with how far through the audio we are.
     Transcribing {
         done_secs: f64,
@@ -42,7 +53,8 @@ pub enum ImportPhase {
     Summarizing,
     Done {
         transcript: PathBuf,
-        /// Why no summary was produced, when that is the case.
+        /// Why the result is less than it could have been — no summary, no
+        /// speaker names — when that applies.
         note: Option<String>,
     },
     Error(String),
@@ -85,6 +97,7 @@ pub fn run_import(
     vad_model: &Path,
     chunk_seconds: u32,
     language: &str,
+    diarize: Option<DiarizeSpec>,
     transcripts_dir: &Path,
     summary: Option<SummarySpec>,
     progress: &Arc<Mutex<Option<ImportPhase>>>,
@@ -92,6 +105,10 @@ pub fn run_import(
     set(progress, ImportPhase::Decoding);
     let samples = decode_to_mono_16k(path).map_err(|e| e.to_string())?;
     let total_secs = samples.len() as f64 / TARGET_RATE as f64;
+
+    // Before transcribing, not after: the transcript file is append-only, so
+    // a line has to know its speaker at the moment it is written.
+    let (voices, mut note) = diarize_file(&samples, diarize.as_ref(), progress);
 
     // Segment the whole file. Segmentation is cheap; do it up front so the
     // progress bar can track the (slow) transcription against a known total.
@@ -118,6 +135,9 @@ pub fn run_import(
     let mut prior = String::new();
     let mut wrote_any = false;
     for span in &spans {
+        let span_end = span.elapsed + span.audio.len() as f64 / TARGET_RATE as f64;
+        let speaker = diarize::speaker_at(&voices, span.elapsed, span_end)
+            .map(diarize::person_label);
         set(
             progress,
             ImportPhase::Transcribing {
@@ -140,7 +160,7 @@ pub fn run_import(
             Ok(t) if !t.trim().is_empty() => {
                 let t = t.trim().to_string();
                 carry_context(&mut prior, &t);
-                let _ = writer.add_segment(span.elapsed, &t);
+                let _ = writer.add_labeled_segment(span.elapsed, speaker.as_deref(), &t);
                 wrote_any = true;
             }
             Ok(_) => {}
@@ -152,7 +172,12 @@ pub fn run_import(
 
     // Summarize (or explain why we couldn't). Either way the transcript is
     // already on disk and worth keeping.
-    let note = maybe_summarize(&out_path, wrote_any, summary, progress);
+    if let Some(summary_note) = maybe_summarize(&out_path, wrote_any, summary, progress) {
+        note = Some(match note {
+            Some(diar) => format!("{diar} {summary_note}"),
+            None => summary_note,
+        });
+    }
 
     set(
         progress,
@@ -196,6 +221,35 @@ fn maybe_summarize(
             // sentence, so it gets the headline plus what to try next.
             log::warn!("import: summary failed: {}", e.report().replace('\n', " | "));
             Some(e.note())
+        },
+    }
+}
+
+/// Cluster the whole file into voices. Returns the spans and, when
+/// diarization was asked for but could not run, a sentence saying so — an
+/// unlabelled transcript is still a transcript, so this never fails the
+/// import.
+fn diarize_file(
+    samples: &[f32],
+    spec: Option<&DiarizeSpec>,
+    progress: &Arc<Mutex<Option<ImportPhase>>>,
+) -> (Vec<SpeakerSpan>, Option<String>) {
+    let Some(spec) = spec else {
+        return (Vec::new(), None);
+    };
+    set(progress, ImportPhase::Diarizing);
+    let result = Diarizer::load(spec).and_then(|d| d.run(samples, TARGET_RATE));
+    match result {
+        Ok(voices) => (voices, None),
+        Err(e) => {
+            log::warn!("import: diarization unavailable: {e}");
+            (
+                Vec::new(),
+                Some(format!(
+                    "Die Sprecher wurden nicht unterschieden ({e}) — das Transkript \
+                     ist ohne Namen."
+                )),
+            )
         },
     }
 }

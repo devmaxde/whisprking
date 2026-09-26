@@ -80,8 +80,11 @@ impl TranscriptWriter {
     /// Append one timestamped segment, optionally attributed to a speaker.
     ///
     /// Meetings capture the microphone and the system output as separate
-    /// tracks, so we know which side of the call each segment came from
-    /// without running diarization over the audio.
+    /// tracks, so the live path knows which side of the call each segment
+    /// came from without any model. The individual voices inside a track are
+    /// a separate, offline job — see [`crate::transcription::diarize`] — and
+    /// reach this writer only through the importer, which passes the name it
+    /// found.
     pub fn add_labeled_segment(
         &self,
         elapsed_seconds: f64,

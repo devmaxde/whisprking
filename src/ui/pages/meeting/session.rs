@@ -169,6 +169,7 @@ impl Session {
             keep_audio,
         );
         self.fetch_vad_model(config);
+        self.fetch_diarize_models(config);
         let tx = self.chunk_tx.as_ref().expect("worker spawned").clone();
 
         let result = self.capture.start(
@@ -397,6 +398,28 @@ impl Session {
                     Ok(p) => log::info!("vad: model ready at {}", p.display()),
                     Err(e) => log::warn!("vad: model download failed: {e}"),
                 });
+        }
+        #[cfg(not(feature = "sherpa"))]
+        let _ = config;
+    }
+
+    /// Same idea for the two speaker-diarization models, which the second
+    /// pass needs when the meeting is over. Fetching them now means the pass
+    /// starts on a model load instead of on a 34 MB download; it would fetch
+    /// them itself either way.
+    fn fetch_diarize_models(&self, config: &Config) {
+        #[cfg(feature = "sherpa")]
+        {
+            if !config.meeting.diarize.enabled || !config.meeting.label_speakers {
+                return;
+            }
+            let models_dir = Config::models_dir(config);
+            if ModelManager::new(&models_dir).is_diarize_downloaded() {
+                return;
+            }
+            let _ = thread::Builder::new()
+                .name("whisprking-diarize-fetch".into())
+                .spawn(move || super::post::ensure_diarize_models(&models_dir));
         }
         #[cfg(not(feature = "sherpa"))]
         let _ = config;

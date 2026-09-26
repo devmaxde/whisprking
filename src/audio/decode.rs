@@ -17,13 +17,12 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 use thiserror::Error;
 
 use super::resample::{Resampler, TARGET_RATE};
@@ -120,59 +119,61 @@ fn decode_symphonia(path: &Path) -> Result<Vec<f32>, DecodeError> {
         hint.with_extension(&ext);
     }
 
-    let probed = symphonia::default::get_probe()
-        .format(
+    let mut format = symphonia::default::get_probe()
+        .probe(
             &hint,
             mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
+            FormatOptions::default(),
+            MetadataOptions::default(),
         )
         .map_err(|e| DecodeError::Unsupported(format!("{display}: {e}")))?;
-    let mut format = probed.format;
 
     let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .default_track(TrackType::Audio)
         .ok_or_else(|| DecodeError::NoAudioTrack(display.clone()))?;
     let track_id = track.id;
+    let audio_params = track
+        .codec_params
+        .as_ref()
+        .and_then(|p| p.audio())
+        .ok_or_else(|| DecodeError::NoAudioTrack(display.clone()))?
+        .clone();
 
     let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
+        .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
         .map_err(|e| DecodeError::Unsupported(format!("{display}: {e}")))?;
 
     let mut resampler: Option<Resampler> = None;
     let mut out: Vec<f32> = Vec::new();
+    // Reused between packets so we don't reallocate per decoded buffer.
+    let mut interleaved: Vec<f32> = Vec::new();
 
     loop {
         let packet = match format.next_packet() {
-            Ok(p) => p,
+            Ok(Some(p)) => p,
             // Clean end of stream, or a mid-stream change we don't follow.
-            Err(SymphoniaError::IoError(e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
+            Ok(None) => break,
+            Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break
             }
             Err(SymphoniaError::ResetRequired) => break,
             Err(e) => return Err(DecodeError::Unsupported(format!("{display}: {e}"))),
         };
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
         match decoder.decode(&packet) {
             Ok(decoded) => {
-                let spec = *decoded.spec();
+                let spec = decoded.spec();
                 let r = resampler
-                    .get_or_insert_with(|| Resampler::new(spec.rate, spec.channels.count()));
-                let mut sbuf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
-                sbuf.copy_interleaved_ref(decoded);
-                r.push_interleaved(sbuf.samples(), &mut out);
+                    .get_or_insert_with(|| Resampler::new(spec.rate(), spec.channels().count()));
+                interleaved.clear();
+                decoded.copy_to_vec_interleaved(&mut interleaved);
+                r.push_interleaved(&interleaved, &mut out);
             }
             // A single corrupt packet is recoverable — skip it.
             Err(SymphoniaError::DecodeError(_)) => continue,
-            Err(SymphoniaError::IoError(e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
+            Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break
             }
             Err(e) => return Err(DecodeError::Unsupported(format!("{display}: {e}"))),

@@ -17,12 +17,13 @@
 | `postprocess::llm`| done          | OpenRouter chat + model listing                    |
 | `utils::permissions` | done       | macOS Accessibility / Mic checks                   |
 | `audio::vad`      | done          | Silero VAD segmentation, fixed-window fallback     |
-| `audio::import`   | done          | Offline file → transcript + LLM summary            |
+| `audio::import`   | done          | Offline file → transcript + LLM summary, per speaker |
 | `output::transcript_doc` | done   | Recording = transcript + derived documents; legacy split |
 | `postprocess::refine` | done      | Runs a preset over a transcript into its own file  |
 | `transcription::model_manager` | done | Catalog, download, extract `.tar.bz2`; Silero VAD asset |
 | `transcription::context` | done   | Prompt carryover + degenerate-decode guard         |
 | `transcription::engine` | partial | `Transcriber` trait; `sherpa-rs` impl behind `--features sherpa` |
+| `transcription::diarize` | done   | pyannote + speaker embeddings → „Person 1 / 2 / …“  |
 | `ui::theme`       | done          | Design tokens, type scale, variable-weight fonts   |
 | `ui::brand`       | done          | The crowned-mic mark; app `.icns`, menu bar, rail  |
 | `ui::icons`       | done          | Vector icon set drawn with the painter             |
@@ -140,7 +141,11 @@ WhisprKing captures the two sides of a call as **separate tracks**:
   (macOS 14.4+).
 
 Both are transcribed independently, so the transcript is speaker-attributed
-without running diarization.
+without running any model at all: while the meeting is live, every line says
+**Du** or **Andere**.
+
+What that cannot do is tell the four people on the *Andere* track apart — see
+[Who said it](#who-said-it).
 
 ### Transcription quality
 
@@ -187,6 +192,10 @@ Once the meeting stops, neither applies. *Einstellungen → Nachbearbeitung*
   minutes of transcript. With no AI provider the best single variant becomes
   the result, and the pass says so.
 
+- **The voices are separated** before any model runs, from the same buffer the
+  segmenter reads, so each line is named after whoever spoke it rather than
+  after the track it came from. See [Who said it](#who-said-it).
+
 Results are two more sibling documents, `<stem>.post.md` and
 `<stem>.post-variants.md`; the live transcript is never touched. While the
 audio is kept, *Verlauf → Nachbearbeitet → Nachbearbeitung starten* re-runs the
@@ -194,6 +203,44 @@ whole thing with whatever models are selected now.
 
 The merge prompt is `src/postprocess/prompts/reconcile.txt` and is editable
 like any other (*Einstellungen → Prompts → Modelle zusammenführen*).
+
+### Who said it
+
+Two tracks separate the two *sides* of a call. They do not separate the people
+on the other side, and an imported file has no sides at all. Both are what
+**speaker diarization** is for, and it runs on the finished recording
+(*Einstellungen → Meeting → Sprecher unterscheiden*, on by default):
+
+- **pyannote segmentation 3.0** finds speech and marks every point where the
+  voice changes.
+- **A speaker-embedding model** (3D-Speaker CAM++) turns each of those
+  stretches into a vector, and the vectors are clustered — one cluster per
+  voice.
+
+Every transcript line is then attributed to whichever voice covers most of it,
+and the voices are numbered in the order they are first heard: **Person 1**,
+**Person 2**, … The microphone track keeps **Du** for whoever does most of the
+talking on it — it is your microphone — so somebody sitting in the room with
+you shows up as a numbered person on the same track.
+
+This is why it is an offline pass and never runs live: a cluster only exists
+once every stretch of the recording has been embedded, so *Person 2* cannot be
+named before the recording is over. Concretely it happens
+
+- in the **second pass** after a meeting (so it needs *Nachbearbeitung* on),
+  writing into `<stem>.post.md`; the live transcript keeps its Du/Andere and is
+  never rewritten;
+- and in the **importer**, where it is the only source of speaker names at all.
+
+*Anzahl Personen* is `Automatisch` by default and estimated from the audio.
+Pinning the number is the one thing that reliably beats the estimate, so set it
+when you know it. Accuracy falls as people are added, and overlapping speech is
+where every diarizer is weakest — two people talking over each other land on
+whoever spoke more of the line.
+
+Both models are fetched once on first use (~34 MB together) and need a
+`sherpa` build, exactly like the VAD. Without them the pass still runs and the
+transcript says why it has no names.
 
 ### Models
 
@@ -222,6 +269,11 @@ Worth it for imported recordings, painful for dictation.
 
 Switching models does not delete the old one — each lives in its own directory
 under the models dir, so going back is instant.
+
+Three more models are fetched automatically rather than chosen: the ~2 MB
+Silero VAD, and the two diarization models — `pyannote_segmentation/model.onnx`
+(~7 MB) and the 3D-Speaker CAM++ embedding (~27 MB). None of them is ever
+selected as a transcription model, so none of them appears in the list.
 
 **Meeting language** is its own setting (Settings → *Meeting-Sprache*), because
 a meeting is decoded segment by segment and `Auto` re-detects on every one —

@@ -382,6 +382,7 @@ impl MeetingPage {
         let mut dismiss = false;
         match phase {
             ImportPhase::Decoding => w::busy_row(ui, "Audio wird dekodiert …"),
+            ImportPhase::Diarizing => w::busy_row(ui, "Sprecher werden unterschieden …"),
             ImportPhase::Transcribing {
                 done_secs,
                 total_secs,
@@ -481,6 +482,9 @@ impl MeetingPage {
         match phase {
             PostPhase::Preparing => {
                 w::busy_row(ui, "Nachbearbeitung: Aufnahme wird gelesen und segmentiert …")
+            },
+            PostPhase::Diarizing => {
+                w::busy_row(ui, "Nachbearbeitung: Sprecher werden unterschieden …")
             },
             PostPhase::Transcribing(models) => {
                 w::busy_row(

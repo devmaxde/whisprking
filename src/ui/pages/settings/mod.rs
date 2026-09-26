@@ -9,10 +9,10 @@ mod models;
 
 use crate::config::Config;
 use crate::hotkey::listener::HotkeyName;
-use crate::transcription::model_manager::{available_models, ModelManager};
+use crate::transcription::model_manager::{available_models, ModelManager, DIARIZE_SIZE_MB};
 use crate::ui::icons::Icon;
 use crate::ui::theme::{self, space, text};
-use crate::ui::widgets::{self as w, ButtonKind};
+use crate::ui::widgets::{self as w, ButtonKind, Tone};
 
 use models::DownloadJob;
 
@@ -214,6 +214,9 @@ impl SettingsPage {
                 }
                 w::divider(ui);
 
+                self.diarize_rows(ui, config);
+                w::divider(ui);
+
                 let mut save_audio = config.meeting.save_audio;
                 if w::toggle_row(
                     ui,
@@ -227,6 +230,93 @@ impl SettingsPage {
                 }
             },
         );
+    }
+
+    /// Telling the individual voices inside a track apart.
+    ///
+    /// Sits under "Sprecher benennen" because it is the finer version of the
+    /// same thing: without it a line says which *side* spoke, with it who.
+    /// Switched off when the lines carry no name at all, which is what the
+    /// row above decides.
+    fn diarize_rows(&mut self, ui: &mut egui::Ui, config: &mut Config) {
+        let installed = ModelManager::new(Config::models_dir(config)).is_diarize_downloaded();
+
+        let mut enabled = config.meeting.diarize.enabled;
+        if w::toggle_row(
+            ui,
+            "Sprecher unterscheiden",
+            "Nach dem Meeting wird die Aufnahme in einzelne Stimmen zerlegt: \
+             statt „Andere“ steht dann „Person 1“, „Person 2“ … in jeder Zeile. \
+             Läuft nur nachträglich — wer „Person 2“ ist, steht erst fest, wenn \
+             die ganze Aufnahme gehört wurde.",
+            &mut enabled,
+        ) {
+            config.meeting.diarize.enabled = enabled;
+            let _ = config.save();
+        }
+
+        if !enabled || !config.meeting.label_speakers {
+            if enabled {
+                ui.add_space(space::XS);
+                w::hint(
+                    ui,
+                    "Ohne „Sprecher benennen“ trägt keine Zeile einen Namen — \
+                     die Unterscheidung bliebe unsichtbar und läuft deshalb nicht.",
+                );
+            }
+            return;
+        }
+
+        ui.add_space(space::SM);
+        w::setting_row(
+            ui,
+            "Anzahl Personen",
+            "„Automatisch“ schätzt sie aus der Aufnahme. Eine feste Zahl ist \
+             zuverlässiger, wenn man sie kennt.",
+            |ui| {
+                let options: Vec<(u32, String)> = std::iter::once((0, "Automatisch".to_string()))
+                    .chain((2..=8).map(|n| (n, format!("{n} Personen"))))
+                    .collect();
+                let current = config.meeting.diarize.speakers;
+                let label = options
+                    .iter()
+                    .find(|(n, _)| *n == current)
+                    .map(|(_, l)| l.clone())
+                    .unwrap_or_else(|| format!("{current} Personen"));
+                if w::combo(
+                    ui,
+                    "diarize-speakers",
+                    170.0,
+                    &mut config.meeting.diarize.speakers,
+                    &options,
+                    &label,
+                ) {
+                    let _ = config.save();
+                }
+            },
+        );
+
+        if !config.meeting.post_transcribe.enabled {
+            ui.add_space(space::XS);
+            w::hint(
+                ui,
+                "Für Meetings passiert das in der Nachbearbeitung, und die ist \
+                 gerade aus — importierte Aufnahmen bekommen trotzdem Namen.",
+            );
+        }
+
+        ui.add_space(space::XS);
+        if installed {
+            w::badge(ui, "Sprechermodelle installiert", Tone::Success);
+        } else {
+            w::hint(
+                ui,
+                &format!(
+                    "Die beiden Sprechermodelle (~{DIARIZE_SIZE_MB} MB) werden beim \
+                     ersten Lauf automatisch geladen.",
+                ),
+            );
+        }
     }
 
     // --- Nachbearbeitung ---------------------------------------------------

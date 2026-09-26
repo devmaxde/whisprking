@@ -80,6 +80,10 @@ pub struct MeetingConfig {
     /// Label each transcript line with which side spoke.
     #[serde(default = "default_true")]
     pub label_speakers: bool,
+    /// Tell the individual voices inside a track apart, once the recording is
+    /// over. See [`DiarizeConfig`].
+    #[serde(default)]
+    pub diarize: DiarizeConfig,
     /// Second transcription pass over the saved audio once a meeting ends.
     #[serde(default)]
     pub post_transcribe: PostTranscribeConfig,
@@ -92,6 +96,40 @@ pub struct MeetingConfig {
 
 fn default_true() -> bool {
     true
+}
+
+/// Who said what, rather than which side said it.
+///
+/// Recording the microphone and the system output separately already tells the
+/// two sides of a call apart, and costs nothing. It cannot tell four people on
+/// the "Andere" track apart, and an imported file has no sides at all — that
+/// needs a model, which is what this switches on. See
+/// [`crate::transcription::diarize`].
+///
+/// It only ever runs on a finished recording: the voices are found by
+/// clustering the whole thing, so "Person 2" does not exist until the last
+/// word is in. The live transcript keeps its Du/Andere labels either way.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiarizeConfig {
+    pub enabled: bool,
+    /// How many people to expect. `0` estimates it from the audio; set it when
+    /// you know, because a known count is the one thing that reliably beats
+    /// the estimate.
+    pub speakers: u32,
+    /// How different two stretches of speech have to sound before they are
+    /// treated as two people. Only used when `speakers` is 0. Lower splits
+    /// more eagerly.
+    pub threshold: f32,
+}
+
+impl Default for DiarizeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            speakers: 0,
+            threshold: 0.5,
+        }
+    }
 }
 
 /// What happens after the recording stops.
@@ -198,6 +236,7 @@ impl Default for Config {
                 save_audio: false,
                 chunk_duration_seconds: 10,
                 label_speakers: true,
+                diarize: DiarizeConfig::default(),
                 post_transcribe: PostTranscribeConfig::default(),
                 blackhole: BlackHoleSetup::default(),
             },
@@ -360,6 +399,22 @@ mod tests {
         // defaults filled in
         assert_eq!(cfg.dictation.model, "whisper-turbo");
         assert_eq!(cfg.meeting.chunk_duration_seconds, 10);
+    }
+
+    /// A config written before diarization existed must come back with it in
+    /// its default state rather than failing to parse.
+    #[test]
+    fn diarization_defaults_into_an_older_config() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"meeting": {"label_speakers": true, "chunk_duration_seconds": 10}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load(path).unwrap();
+        assert!(cfg.meeting.diarize.enabled);
+        assert_eq!(cfg.meeting.diarize.speakers, 0);
     }
 
     /// A config written before meetings had their own language must keep
